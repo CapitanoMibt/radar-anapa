@@ -30,6 +30,28 @@ def init_db():
             """)
 
             cur.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS source_name VARCHAR(200)
+            """)
+
+            cur.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS source_url TEXT
+            """)
+
+            cur.execute("""
+                ALTER TABLE messages
+                ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64)
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                messages_fingerprint_unique
+                ON messages (fingerprint)
+                WHERE fingerprint IS NOT NULL
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS sources (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(200) NOT NULL,
