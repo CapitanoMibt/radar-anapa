@@ -1,8 +1,10 @@
 
 
+
 import os
 import secrets
 import html
+from urllib.parse import urlparse
 
 import psycopg
 
@@ -11,6 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from database import init_db, DATABASE_URL
+
 
 app = FastAPI(title="Радар-Бот")
 
@@ -47,8 +50,15 @@ def db_query(query, params=()):
             return cur.fetchall()
 
 
+def db_execute(query, params=()):
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+
+
 def get_count(table):
     allowed = {"messages", "sources", "drafts", "audit_log"}
+
     if table not in allowed:
         return 0
 
@@ -59,59 +69,69 @@ def get_count(table):
         return 0
 
 
+def log_action(action, details=""):
+    db_execute(
+        """
+        INSERT INTO audit_log (action, details)
+        VALUES (%s, %s)
+        """,
+        (action, details[:500])
+    )
+
+
+def safe_text(value):
+    return html.escape(str(value or ""))
+
+
 def panel_content(page):
     if page == "dashboard":
-        messages = get_count("messages")
-        sources = get_count("sources")
-        drafts = get_count("drafts")
-
         return f"""
         <section class="welcome">
-            <h2>Добро пожаловать в Радар-Бот!</h2>
+            <h2>Добро пожаловать!</h2>
             <p>Центр управления проектом «Радар Анапа».</p>
         </section>
 
         <div class="stats">
             <div class="stat">
                 <span>Сообщения</span>
-                <b>{messages}</b>
+                <b>{get_count("messages")}</b>
             </div>
+
             <div class="stat">
                 <span>Источники</span>
-                <b>{sources}</b>
+                <b>{get_count("sources")}</b>
             </div>
+
             <div class="stat">
                 <span>Черновики</span>
-                <b>{drafts}</b>
+                <b>{get_count("drafts")}</b>
             </div>
         </div>
 
         <section class="panel">
-            <h3>Состояние системы</h3>
-            <p><span class="green-dot"></span> Панель работает</p>
-            <p>База данных подключается через PostgreSQL.</p>
-            <p>Автоматический мониторинг пока не подключён.</p>
+            <h2>Состояние системы</h2>
+            <p><span class="green-dot"></span> Панель управления работает</p>
+            <p>База данных подключена через PostgreSQL.</p>
+            <p>Автоматический мониторинг пока не настроен.</p>
         </section>
         """
 
     if page == "messages":
-        try:
-            rows = db_query("""
-                SELECT title, content, status, created_at
-                FROM messages
-                ORDER BY created_at DESC
-                LIMIT 50
-            """)
-        except Exception:
-            rows = []
+        rows = db_query("""
+            SELECT title, content, status, created_at
+            FROM messages
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
 
         items = ""
+
         for title, content, status, created in rows:
             items += f"""
             <article class="item">
-                <h3>{html.escape(title)}</h3>
-                <p>{html.escape(content or "")}</p>
-                <small>{html.escape(status)} · {created}</small>
+                <h3>{safe_text(title)}</h3>
+                <p>{safe_text(content)}</p>
+                <small>{safe_text(status)} · {created}</small>
             </article>
             """
 
@@ -123,80 +143,102 @@ def panel_content(page):
         """
 
     if page == "sources":
-        try:
-            rows = db_query("""
-                SELECT name, url, status
-                FROM sources
-                ORDER BY created_at DESC
-            """)
-        except Exception:
-            rows = []
+        rows = db_query("""
+            SELECT id, name, url, status
+            FROM sources
+            ORDER BY created_at DESC
+        """)
 
         items = ""
-        for name, url, status in rows:
+
+        for source_id, name, url, status in rows:
             items += f"""
             <article class="item">
-                <h3>{html.escape(name)}</h3>
-                <p>{html.escape(url)}</p>
-                <small>Статус: {html.escape(status)}</small>
+                <h3>{safe_text(name)}</h3>
+                <p>{safe_text(url)}</p>
+                <small>Статус: {safe_text(status)}</small>
             </article>
             """
 
         return f"""
         <section class="panel">
             <h2>Источники информации</h2>
-            {items or '<p class="muted">Источники пока не добавлены.</p>'}
+            {items or '<p class="muted">Источников пока нет.</p>'}
             <p class="muted">
-                Подключение возможно через разрешённые API.
+                Подключение доступно через разрешённые API.
             </p>
         </section>
         """
 
     if page == "drafts":
-        try:
-            rows = db_query("""
-                SELECT title, content, status, created_at
-                FROM drafts
-                ORDER BY created_at DESC
-            """)
-        except Exception:
-            rows = []
+        rows = db_query("""
+            SELECT id, title, content, status, created_at
+            FROM drafts
+            ORDER BY created_at DESC
+        """)
 
         items = ""
-        for title, content, status, created in rows:
+
+        for draft_id, title, content, status, created in rows:
             items += f"""
             <article class="item">
-                <h3>{html.escape(title)}</h3>
-                <p>{html.escape(content)}</p>
-                <small>{html.escape(status)} · {created}</small>
+                <h3>{safe_text(title)}</h3>
+                <p>{safe_text(content)}</p>
+                <small>{safe_text(status)} · {created}</small>
+
+                <form action="/drafts/{draft_id}/delete"
+                      method="post"
+                      onsubmit="return confirm('Удалить черновик?')">
+                    <button class="danger" type="submit">
+                        Удалить
+                    </button>
+                </form>
             </article>
             """
 
         return f"""
         <section class="panel">
-            <h2>Черновики</h2>
+            <h2>Создать черновик</h2>
+
+            <form action="/drafts/create" method="post">
+                <input name="title"
+                       placeholder="Заголовок"
+                       maxlength="200"
+                       required>
+
+                <textarea name="content"
+                          placeholder="Текст сообщения"
+                          maxlength="10000"
+                          rows="5"
+                          required></textarea>
+
+                <button type="submit">
+                    Сохранить черновик
+                </button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Сохранённые черновики</h2>
             {items or '<p class="muted">Черновиков пока нет.</p>'}
-            <p>Публикации требуют ручного подтверждения.</p>
         </section>
         """
 
     if page == "history":
-        try:
-            rows = db_query("""
-                SELECT action, details, created_at
-                FROM audit_log
-                ORDER BY created_at DESC
-                LIMIT 50
-            """)
-        except Exception:
-            rows = []
+        rows = db_query("""
+            SELECT action, details, created_at
+            FROM audit_log
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
 
         items = ""
+
         for action, details, created in rows:
             items += f"""
             <article class="item">
-                <b>{html.escape(action)}</b>
-                <p>{html.escape(details or "")}</p>
+                <b>{safe_text(action)}</b>
+                <p>{safe_text(details)}</p>
                 <small>{created}</small>
             </article>
             """
@@ -214,10 +256,10 @@ def panel_content(page):
             <h2>Настройки проекта</h2>
             <p>Название: Радар Анапа</p>
             <p>Панель: Радар-Бот</p>
-            <p>Версия: 1.0</p>
-            <p>Режим: закрытый</p>
+            <p>Версия: 1.1</p>
             <p>Хостинг: Render</p>
             <p>База данных: PostgreSQL</p>
+            <p>Режим: закрытая административная панель</p>
         </section>
         """
 
@@ -229,55 +271,58 @@ def render_login(error=""):
     <!DOCTYPE html>
     <html lang="ru">
     <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Вход — Радар-Бот</title>
-    <style>
-    * {{box-sizing:border-box}}
-    body {{
-        margin:0;
-        min-height:100vh;
-        display:grid;
-        place-items:center;
-        background:#102c52;
-        font-family:Arial,sans-serif;
-        padding:20px;
-    }}
-    form {{
-        background:white;
-        padding:35px;
-        border-radius:18px;
-        width:min(100%,380px);
-    }}
-    h1 {{color:#17477d}}
-    input {{
-        width:100%;
-        padding:14px;
-        border:1px solid #ccd6e3;
-        border-radius:8px;
-        margin:15px 0;
-    }}
-    button {{
-        width:100%;
-        padding:14px;
-        background:#2468a8;
-        color:white;
-        border:0;
-        border-radius:8px;
-        font-size:16px;
-    }}
-    .error {{color:#d33}}
-    </style>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width,initial-scale=1">
+        <title>Вход — Радар-Бот</title>
+        <style>
+            * {{ box-sizing:border-box; }}
+            body {{
+                margin:0;
+                min-height:100vh;
+                display:grid;
+                place-items:center;
+                background:#102c52;
+                font-family:Arial,sans-serif;
+                padding:20px;
+            }}
+            form {{
+                background:white;
+                padding:35px;
+                border-radius:18px;
+                width:min(100%,380px);
+            }}
+            h1 {{ color:#17477d; }}
+            input {{
+                width:100%;
+                padding:14px;
+                border:1px solid #ccd6e3;
+                border-radius:8px;
+                margin:15px 0;
+            }}
+            button {{
+                width:100%;
+                padding:14px;
+                background:#2468a8;
+                color:white;
+                border:0;
+                border-radius:8px;
+                font-size:16px;
+            }}
+            .error {{ color:#d33; }}
+        </style>
     </head>
     <body>
-    <form action="/login" method="post">
-        <h1>◈ РАДАР-БОТ</h1>
-        <p>Закрытая панель управления</p>
-        <input type="password" name="password"
-        placeholder="Пароль" required>
-        <button type="submit">Войти</button>
-        <p class="error">{html.escape(error)}</p>
-    </form>
+        <form action="/login" method="post">
+            <h1>◈ РАДАР-БОТ</h1>
+            <p>Закрытая панель управления</p>
+            <input type="password"
+                   name="password"
+                   placeholder="Пароль"
+                   required>
+            <button type="submit">Войти</button>
+            <p class="error">{safe_text(error)}</p>
+        </form>
     </body>
     </html>
     """
@@ -289,18 +334,11 @@ async def login_page():
 
 
 @app.post("/login")
-async def login(
-    request: Request,
-    password: str = Form(...)
-):
+async def login(request: Request, password: str = Form(...)):
     if secrets.compare_digest(password, ADMIN_PASSWORD):
         request.session.clear()
         request.session["logged_in"] = True
-
-        return RedirectResponse(
-            "/",
-            status_code=303
-        )
+        return RedirectResponse("/", status_code=303)
 
     return HTMLResponse(
         render_login("Неверный пароль"),
@@ -333,204 +371,260 @@ async def home(request: Request, page: str = "dashboard"):
     <!DOCTYPE html>
     <html lang="ru">
     <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>{PAGES[page]} — Радар-Бот</title>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width,initial-scale=1">
+        <title>{PAGES[page]} — Радар-Бот</title>
 
-    <style>
-    * {{box-sizing:border-box}}
+        <style>
+            * {{ box-sizing:border-box; }}
 
-    body {{
-        margin:0;
-        background:#f3f6fb;
-        color:#17243a;
-        font-family:Arial,sans-serif;
-    }}
+            body {{
+                margin:0;
+                background:#f3f6fb;
+                color:#17243a;
+                font-family:Arial,sans-serif;
+            }}
 
-    .sidebar {{
-        position:fixed;
-        inset:0 auto 0 0;
-        width:245px;
-        background:#102c52;
-        color:white;
-        padding:25px 16px;
-    }}
+            .sidebar {{
+                position:fixed;
+                inset:0 auto 0 0;
+                width:245px;
+                background:#102c52;
+                color:white;
+                padding:25px 16px;
+            }}
 
-    .brand {{
-        font-size:23px;
-        font-weight:bold;
-        padding:8px 12px 30px;
-    }}
+            .brand {{
+                font-size:23px;
+                font-weight:bold;
+                padding:8px 12px 30px;
+            }}
 
-    .brand small {{
-        display:block;
-        font-size:12px;
-        color:#a9c6e9;
-        margin-top:7px;
-        font-weight:normal;
-    }}
+            .brand small {{
+                display:block;
+                font-size:12px;
+                color:#a9c6e9;
+                margin-top:7px;
+                font-weight:normal;
+            }}
 
-    .sidebar a {{
-        display:block;
-        color:#c9d8eb;
-        text-decoration:none;
-        padding:13px 15px;
-        border-radius:9px;
-        margin:5px 0;
-    }}
+            .sidebar a {{
+                display:block;
+                color:#c9d8eb;
+                text-decoration:none;
+                padding:13px 15px;
+                border-radius:9px;
+                margin:5px 0;
+            }}
 
-    .sidebar a.active,
-    .sidebar a:hover {{
-        background:#24548a;
-        color:white;
-    }}
+            .sidebar a.active,
+            .sidebar a:hover {{
+                background:#24548a;
+                color:white;
+            }}
 
-    .logout {{
-        position:absolute;
-        bottom:22px;
-        left:25px;
-    }}
+            .logout {{
+                position:absolute;
+                bottom:22px;
+                left:25px;
+            }}
 
-    main {{
-        margin-left:245px;
-        padding:30px;
-        max-width:1300px;
-    }}
+            main {{
+                margin-left:245px;
+                padding:30px;
+                max-width:1300px;
+            }}
 
-    header {{
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        margin-bottom:28px;
-        gap:15px;
-    }}
+            header {{
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                margin-bottom:28px;
+                gap:15px;
+            }}
 
-    h1 {{font-size:27px;margin:0 0 7px}}
+            h1 {{ font-size:27px; margin:0 0 7px; }}
+            .muted {{ color:#8391a5; }}
 
-    .muted {{color:#8391a5}}
+            .welcome {{
+                background:linear-gradient(110deg,#17477d,#2877bd);
+                color:white;
+                border-radius:16px;
+                padding:25px;
+                margin-bottom:22px;
+            }}
 
-    .welcome {{
-        background:linear-gradient(110deg,#17477d,#2877bd);
-        color:white;
-        border-radius:16px;
-        padding:25px;
-        margin-bottom:22px;
-    }}
+            .stats {{
+                display:grid;
+                grid-template-columns:repeat(3,1fr);
+                gap:16px;
+                margin-bottom:22px;
+            }}
 
-    .stats {{
-        display:grid;
-        grid-template-columns:repeat(3,1fr);
-        gap:16px;
-        margin-bottom:22px;
-    }}
+            .stat,.panel,.item {{
+                background:white;
+                border:1px solid #e5ebf3;
+                border-radius:14px;
+                padding:22px;
+                margin-bottom:16px;
+            }}
 
-    .stat,.panel,.item {{
-        background:white;
-        border:1px solid #e5ebf3;
-        border-radius:14px;
-        padding:22px;
-        margin-bottom:16px;
-    }}
+            .stat span {{
+                display:block;
+                color:#7d8ba0;
+            }}
 
-    .stat span {{
-        display:block;
-        color:#7d8ba0;
-    }}
+            .stat b {{
+                display:block;
+                font-size:32px;
+                margin-top:14px;
+            }}
 
-    .stat b {{
-        display:block;
-        font-size:32px;
-        margin-top:14px;
-    }}
+            .green-dot {{
+                display:inline-block;
+                width:9px;
+                height:9px;
+                background:#19b879;
+                border-radius:50%;
+                margin-right:8px;
+            }}
 
-    .green-dot {{
-        display:inline-block;
-        width:9px;
-        height:9px;
-        background:#19b879;
-        border-radius:50%;
-        margin-right:8px;
-    }}
+            input,textarea {{
+                width:100%;
+                padding:13px;
+                border:1px solid #d5deea;
+                border-radius:8px;
+                margin:8px 0;
+                font:inherit;
+            }}
 
-    button {{
-        background:#2468a8;
-        color:white;
-        border:0;
-        padding:10px 17px;
-        border-radius:8px;
-        cursor:pointer;
-    }}
+            button {{
+                background:#2468a8;
+                color:white;
+                border:0;
+                padding:11px 17px;
+                border-radius:8px;
+                cursor:pointer;
+            }}
 
-    @media(max-width:750px) {{
-        .sidebar {{
-            position:static;
-            width:auto;
-            padding:15px;
-        }}
+            button.danger {{
+                background:#c74343;
+                margin-top:12px;
+            }}
 
-        .brand {{padding-bottom:12px}}
+            @media(max-width:750px) {{
+                .sidebar {{
+                    position:static;
+                    width:auto;
+                    padding:15px;
+                }}
 
-        .sidebar nav {{
-            display:flex;
-            overflow-x:auto;
-            gap:5px;
-        }}
+                .brand {{ padding-bottom:12px; }}
 
-        .sidebar a {{white-space:nowrap}}
+                .sidebar nav {{
+                    display:flex;
+                    overflow-x:auto;
+                    gap:5px;
+                }}
 
-        .logout {{
-            position:static;
-            display:block;
-            margin:12px;
-        }}
+                .sidebar a {{ white-space:nowrap; }}
 
-        main {{
-            margin:0;
-            padding:18px;
-        }}
+                .logout {{
+                    position:static;
+                    display:block;
+                    margin:12px;
+                }}
 
-        .stats {{grid-template-columns:1fr}}
-    }}
-    </style>
+                main {{
+                    margin:0;
+                    padding:18px;
+                }}
+
+                .stats {{ grid-template-columns:1fr; }}
+            }}
+        </style>
     </head>
 
     <body>
-
-    <aside class="sidebar">
-        <div class="brand">
-            ◈ РАДАР-БОТ
-            <small>Центр управления</small>
-        </div>
-
-        <nav>{nav}</nav>
-
-        <a class="logout" href="/logout">↪ Выйти</a>
-    </aside>
-
-    <main>
-        <header>
-            <div>
-                <h1>{PAGES[page]}</h1>
-                <span class="muted">
-                    Управление проектом «Радар Анапа»
-                </span>
+        <aside class="sidebar">
+            <div class="brand">
+                ◈ РАДАР-БОТ
+                <small>Центр управления</small>
             </div>
 
-            <button onclick="location.reload()">
-                Обновить
-            </button>
-        </header>
+            <nav>{nav}</nav>
+            <a class="logout" href="/logout">↪ Выйти</a>
+        </aside>
 
-        {content}
-    </main>
+        <main>
+            <header>
+                <div>
+                    <h1>{PAGES[page]}</h1>
+                    <span class="muted">
+                        Управление проектом «Радар Анапа»
+                    </span>
+                </div>
 
+                <button onclick="location.reload()">
+                    Обновить
+                </button>
+            </header>
+
+            {content}
+        </main>
     </body>
     </html>
     """)
+
+
+@app.post("/drafts/create")
+async def create_draft(
+    request: Request,
+    title: str = Form(...),
+    content: str = Form(...)
+):
+    if not request.session.get("logged_in"):
+        return RedirectResponse("/login", status_code=303)
+
+    title = title.strip()
+    content = content.strip()
+
+    if not title or not content:
+        return RedirectResponse("/?page=drafts", status_code=303)
+
+    db_execute(
+        """
+        INSERT INTO drafts (title, content)
+        VALUES (%s, %s)
+        """,
+        (title[:200], content[:10000])
+    )
+
+    log_action("Создан черновик", title[:200])
+
+    return RedirectResponse("/?page=drafts", status_code=303)
+
+
+@app.post("/drafts/{draft_id}/delete")
+async def delete_draft(
+    request: Request,
+    draft_id: int
+):
+    if not request.session.get("logged_in"):
+        return RedirectResponse("/login", status_code=303)
+
+    db_execute(
+        "DELETE FROM drafts WHERE id = %s",
+        (draft_id,)
+    )
+
+    log_action("Удалён черновик", f"ID: {draft_id}")
+
+    return RedirectResponse("/?page=drafts", status_code=303)
 
 
 @app.get("/logout")
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
-
