@@ -1,10 +1,9 @@
 
-
-
 import os
 import secrets
 import html
-from urllib.parse import urlparse
+import asyncio
+import logging
 
 import psycopg
 
@@ -13,7 +12,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from database import init_db, DATABASE_URL
+from monitor import check_sources
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("radar-bot")
 
 app = FastAPI(title="Радар-Бот")
 
@@ -27,15 +29,12 @@ app.add_middleware(
     same_site="lax"
 )
 
-
-@app.on_event("startup")
-async def startup():
-    init_db()
-
+monitor_task = None
 
 PAGES = {
     "dashboard": "Главная",
     "messages": "Сообщения",
+    "monitor": "Мониторинг",
     "sources": "Источники",
     "drafts": "Черновики",
     "history": "История",
@@ -83,7 +82,39 @@ def safe_text(value):
     return html.escape(str(value or ""))
 
 
+async def monitor_loop():
+    while True:
+        try:
+            await asyncio.to_thread(check_sources)
+        except Exception:
+            logger.exception("Ошибка автоматической проверки")
+
+        await asyncio.sleep(15 * 60)
+
+
+@app.on_event("startup")
+async def startup():
+    global monitor_task
+
+    init_db()
+    monitor_task = asyncio.create_task(monitor_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global monitor_task
+
+    if monitor_task:
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+
 def panel_content(page):
+
     if page == "dashboard":
         return f"""
         <section class="welcome">
@@ -110,9 +141,9 @@ def panel_content(page):
 
         <section class="panel">
             <h2>Состояние системы</h2>
-            <p><span class="green-dot"></span> Панель управления работает</p>
-            <p>База данных подключена через PostgreSQL.</p>
-            <p>Автоматический мониторинг пока не настроен.</p>
+            <p><span class="green-dot"></span> Панель работает</p>
+            <p>База данных: PostgreSQL</p>
+            <p>Автоматическая проверка: каждые 15 минут</p>
         </section>
         """
 
@@ -131,7 +162,7 @@ def panel_content(page):
             <article class="item">
                 <h3>{safe_text(title)}</h3>
                 <p>{safe_text(content)}</p>
-                <small>{safe_text(status)} · {created}</small>
+                <small>{safe_text(status)} · {safe_text(created)}</small>
             </article>
             """
 
@@ -139,6 +170,58 @@ def panel_content(page):
         <section class="panel">
             <h2>Входящие сообщения</h2>
             {items or '<p class="muted">Сообщений пока нет.</p>'}
+        </section>
+        """
+
+    if page == "monitor":
+        rows = db_query("""
+            SELECT title, content, status,
+                   source_name, source_url, created_at
+            FROM messages
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
+
+        items = ""
+
+        for title, content, status, source, url, created in rows:
+            safe_url = safe_text(url)
+
+            items += f"""
+            <article class="item">
+                <h3>{safe_text(title)}</h3>
+                <p>{safe_text(content)}</p>
+                <small>
+                    {safe_text(source)} · {safe_text(status)}
+                </small>
+                <p>
+                    <a href="{safe_url}"
+                       target="_blank"
+                       rel="noopener noreferrer">
+                       Открыть оригинал
+                    </a>
+                </p>
+                <small>{safe_text(created)}</small>
+            </article>
+            """
+
+        return f"""
+        <section class="panel">
+            <h2>Автоматический мониторинг</h2>
+            <p>Проверка источников каждые 15 минут.</p>
+            <p>Новые официальные публикации сохраняются
+            для ручной проверки.</p>
+
+            <form action="/monitor/run" method="post">
+                <button type="submit">
+                    Проверить сейчас
+                </button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Найденные публикации</h2>
+            {items or '<p class="muted">Публикаций пока нет.</p>'}
         </section>
         """
 
@@ -164,9 +247,6 @@ def panel_content(page):
         <section class="panel">
             <h2>Источники информации</h2>
             {items or '<p class="muted">Источников пока нет.</p>'}
-            <p class="muted">
-                Подключение доступно через разрешённые API.
-            </p>
         </section>
         """
 
@@ -184,7 +264,7 @@ def panel_content(page):
             <article class="item">
                 <h3>{safe_text(title)}</h3>
                 <p>{safe_text(content)}</p>
-                <small>{safe_text(status)} · {created}</small>
+                <small>{safe_text(status)} · {safe_text(created)}</small>
 
                 <form action="/drafts/{draft_id}/delete"
                       method="post"
@@ -239,7 +319,7 @@ def panel_content(page):
             <article class="item">
                 <b>{safe_text(action)}</b>
                 <p>{safe_text(details)}</p>
-                <small>{created}</small>
+                <small>{safe_text(created)}</small>
             </article>
             """
 
@@ -256,7 +336,7 @@ def panel_content(page):
             <h2>Настройки проекта</h2>
             <p>Название: Радар Анапа</p>
             <p>Панель: Радар-Бот</p>
-            <p>Версия: 1.1</p>
+            <p>Версия: 1.2</p>
             <p>Хостинг: Render</p>
             <p>База данных: PostgreSQL</p>
             <p>Режим: закрытая административная панель</p>
@@ -513,6 +593,8 @@ async def home(request: Request, page: str = "dashboard"):
                 margin-top:12px;
             }}
 
+            a {{ color:#2468a8; }}
+
             @media(max-width:750px) {{
                 .sidebar {{
                     position:static;
@@ -578,6 +660,21 @@ async def home(request: Request, page: str = "dashboard"):
     """)
 
 
+@app.post("/monitor/run")
+async def run_monitor_now(request: Request):
+    if not request.session.get("logged_in"):
+        return RedirectResponse("/login", status_code=303)
+
+    try:
+        await asyncio.to_thread(check_sources)
+        log_action("Запущена ручная проверка источников")
+    except Exception:
+        logger.exception("Ошибка ручной проверки")
+        log_action("Ошибка проверки источников")
+
+    return RedirectResponse("/?page=monitor", status_code=303)
+
+
 @app.post("/drafts/create")
 async def create_draft(
     request: Request,
@@ -607,10 +704,7 @@ async def create_draft(
 
 
 @app.post("/drafts/{draft_id}/delete")
-async def delete_draft(
-    request: Request,
-    draft_id: int
-):
+async def delete_draft(request: Request, draft_id: int):
     if not request.session.get("logged_in"):
         return RedirectResponse("/login", status_code=303)
 
